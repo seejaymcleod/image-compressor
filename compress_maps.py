@@ -17,7 +17,7 @@ def parse_size(size_str):
         return float(size_str[:-1])
     return float(size_str)
 
-def compress_image(input_path, output_path, max_file_size, orig_size, out_format="WEBP", scale=1.0, max_dim=8192):
+def compress_image(input_path, output_path, max_file_size, orig_size, out_format="WEBP", scale=1.0, max_dim=8192, forcesquare=None):
     # Open the image
     try:
         Image.MAX_IMAGE_PIXELS = None  # Disable decompression bomb protection for huge maps
@@ -33,17 +33,49 @@ def compress_image(input_path, output_path, max_file_size, orig_size, out_format
 
     # First, calculate scale needed to fit within max_dim
     fit_scale = 1.0
-    if img.width > max_dim or img.height > max_dim:
-        fit_scale = max_dim / max(img.width, img.height)
+    img_max_edge = max(img.width, img.height)
+    if img_max_edge > max_dim:
+        fit_scale = max_dim / img_max_edge
         
     # Apply the user-defined scale on top of the fit scale
-    scale_factor = fit_scale * scale
+    base_scale = fit_scale * scale
     
+    # Mathematical estimation to prevent useless compression attempts
+    # Estimate the maximum number of pixels that can realistically fit in max_file_size
+    # at lowest acceptable quality (roughly 0.15 bytes per pixel for lossy, 1.0 for PNG)
+    # Note: we only count actual image pixels here because padding compresses to almost 0 bytes.
+    bytes_per_pixel = 1.0 if out_format.upper() == "PNG" else 0.15
+    max_estimated_pixels = max_file_size / bytes_per_pixel
+    current_pixels = (img.width * base_scale) * (img.height * base_scale)
+    
+    if current_pixels > max_estimated_pixels:
+        estimated_scale_reduction = (max_estimated_pixels / current_pixels) ** 0.5
+        base_scale *= estimated_scale_reduction
+        print(f"Mathematical estimation: Pre-scaling by an additional {estimated_scale_reduction*100:.1f}% to fit target size.")
+    
+    scale_factor = 1.0
     while scale_factor >= 0.1:
-        new_size = (int(img.width * scale_factor), int(img.height * scale_factor))
-        resized_img = img.resize(new_size, Image.Resampling.LANCZOS) if scale_factor < 1.0 else img
+        current_scale = base_scale * scale_factor
+        new_size = (int(img.width * current_scale), int(img.height * current_scale))
         
-        print(f"Trying to compress {input_path.name} at {new_size[0]}x{new_size[1]}...")
+        # Prevent 0-size dimensions
+        new_size = (max(1, new_size[0]), max(1, new_size[1]))
+        
+        resized_img = img.resize(new_size, Image.Resampling.LANCZOS) if current_scale < 1.0 else img
+        
+        # Apply forcesquare padding right before checking size/saving
+        if forcesquare is not None:
+            sq_edge = max(resized_img.width, resized_img.height) if forcesquare == -1 else forcesquare
+            if resized_img.width != sq_edge or resized_img.height != sq_edge:
+                if resized_img.mode == 'P':
+                    resized_img = resized_img.convert("RGBA")
+                bg_color = (0, 0, 0, 0) if resized_img.mode == 'RGBA' else (0, 0, 0)
+                sq_img = Image.new(resized_img.mode, (sq_edge, sq_edge), bg_color)
+                offset = ((sq_edge - resized_img.width) // 2, (sq_edge - resized_img.height) // 2)
+                sq_img.paste(resized_img, offset)
+                resized_img = sq_img
+        
+        print(f"Trying to compress {input_path.name} at {resized_img.width}x{resized_img.height} (image content: {new_size[0]}x{new_size[1]})...")
         
         if out_format.upper() == "PNG":
             # Save lossless PNG with optimization
@@ -103,6 +135,7 @@ def main():
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing compressed files instead of skipping them")
     parser.add_argument("--scale", type=float, default=1.0, help="Initial scale factor to resize image, preserving aspect ratio (default: 1.0)")
     parser.add_argument("--max-dim", type=int, default=8192, help="Maximum dimension (width or height) in pixels, preserving aspect ratio (default: 8192)")
+    parser.add_argument("--forcesquare", nargs='?', const=-1, default=None, type=int, help="Expand canvas size to a square. Provide an optional dimension (e.g. --forcesquare 4096), otherwise defaults to the longer edge.")
     args = parser.parse_args()
     
     max_file_size = parse_size(args.size) * 1024 * 1024
@@ -159,7 +192,7 @@ def main():
             print(f"Skipping {img_file.name} to avoid overwriting input file directly.")
             continue
             
-        compress_image(img_file, output_path, max_file_size, orig_size, out_format, scale=args.scale, max_dim=args.max_dim)
+        compress_image(img_file, output_path, max_file_size, orig_size, out_format, scale=args.scale, max_dim=args.max_dim, forcesquare=args.forcesquare)
         
     print("\nAll done! Compressed files are in the 'compressed_for_kanka' folder.")
 
