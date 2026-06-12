@@ -31,10 +31,13 @@ def compress_image(input_path, output_path, max_file_size, orig_size, out_format
         print(f"Failed to open {input_path.name}: {e}")
         return
 
-    scale_factor = scale
-    
-    if img.width * scale_factor > max_dim or img.height * scale_factor > max_dim:
-        scale_factor = max_dim / max(img.width, img.height)
+    # First, calculate scale needed to fit within max_dim
+    fit_scale = 1.0
+    if img.width > max_dim or img.height > max_dim:
+        fit_scale = max_dim / max(img.width, img.height)
+        
+    # Apply the user-defined scale on top of the fit scale
+    scale_factor = fit_scale * scale
     
     while scale_factor >= 0.1:
         new_size = (int(img.width * scale_factor), int(img.height * scale_factor))
@@ -42,42 +45,51 @@ def compress_image(input_path, output_path, max_file_size, orig_size, out_format
         
         print(f"Trying to compress {input_path.name} at {new_size[0]}x{new_size[1]}...")
         
-        low = 1
-        high = 100
-        best_q_for_scale = None
-        
-        # Binary search for the optimal quality between 1 and 100
-        while low <= high:
-            quality = (low + high) // 2
-            resized_img.save(output_path, out_format, quality=quality)
+        if out_format.upper() == "PNG":
+            # Save lossless PNG with optimization
+            resized_img.save(output_path, "PNG", optimize=True)
             file_size = os.path.getsize(output_path)
             
             if file_size <= max_file_size:
-                best_q_for_scale = quality
-                
-                # If we are within 10% of the target size, it's perfect!
-                if file_size >= max_file_size * 0.9:
-                    break
-                
-                # Too small, try higher quality
-                low = quality + 1
-            else:
-                # Too big, try lower quality
-                high = quality - 1
-                
-        if best_q_for_scale is not None:
-            # Re-save with best quality to ensure output_path has the right file
-            resized_img.save(output_path, out_format, quality=best_q_for_scale)
-            file_size = os.path.getsize(output_path)
-            
-            print(f"Optimal compression found: quality {best_q_for_scale}.")
-            if file_size >= orig_size:
-                print(f"Notice: The compressed {out_format} is actually larger than or equal to the original PNG ({file_size / (1024 * 1024):.2f} MB vs {orig_size / (1024 * 1024):.2f} MB). You might just want to use the original!")
-            else:
                 print(f"Success! {output_path.name} is now {file_size / (1024 * 1024):.2f} MB.")
-            return
+                return
+        else:
+            low = 1
+            high = 100
+            best_q_for_scale = None
             
-        print(f"Even at minimum quality, image is too large. Scaling dimensions down by 20%...")
+            # Binary search for the optimal quality between 1 and 100
+            while low <= high:
+                quality = (low + high) // 2
+                resized_img.save(output_path, out_format, quality=quality)
+                file_size = os.path.getsize(output_path)
+                
+                if file_size <= max_file_size:
+                    best_q_for_scale = quality
+                    
+                    # If we are within 10% of the target size, it's perfect!
+                    if file_size >= max_file_size * 0.9:
+                        break
+                    
+                    # Too small, try higher quality
+                    low = quality + 1
+                else:
+                    # Too big, try lower quality
+                    high = quality - 1
+                    
+            if best_q_for_scale is not None:
+                # Re-save with best quality to ensure output_path has the right file
+                resized_img.save(output_path, out_format, quality=best_q_for_scale)
+                file_size = os.path.getsize(output_path)
+                
+                print(f"Optimal compression found: quality {best_q_for_scale}.")
+                if file_size >= orig_size:
+                    print(f"Notice: The compressed {out_format} is actually larger than or equal to the original ({file_size / (1024 * 1024):.2f} MB vs {orig_size / (1024 * 1024):.2f} MB). You might just want to use the original!")
+                else:
+                    print(f"Success! {output_path.name} is now {file_size / (1024 * 1024):.2f} MB.")
+                return
+            
+        print(f"Even at minimum quality/size, image is too large. Scaling dimensions down by 20%...")
         scale_factor *= 0.8
         
     print(f"Warning: {input_path.name} could not be compressed under {max_file_size / (1024 * 1024):.1f}MB without severe degradation.")
@@ -87,7 +99,7 @@ def main():
     parser.add_argument("path", type=str, nargs="?", default=None, help="Path to a PNG file or directory containing PNG files (default: current directory)")
     parser.add_argument("--dir", type=str, default=None, help="Directory to scan (deprecated, use positional path instead)")
     parser.add_argument("--size", type=str, default="9.5", help="Target maximum file size in MB, e.g. '9.5' or '9.5MB' (default: 9.5)")
-    parser.add_argument("--format", type=str, default="webp", choices=["webp", "jpeg", "jpg"], help="Output format (default: webp)")
+    parser.add_argument("--format", type=str, default="webp", choices=["webp", "jpeg", "jpg", "png"], help="Output format (default: webp)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing compressed files instead of skipping them")
     parser.add_argument("--scale", type=float, default=1.0, help="Initial scale factor to resize image, preserving aspect ratio (default: 1.0)")
     parser.add_argument("--max-dim", type=int, default=8192, help="Maximum dimension (width or height) in pixels, preserving aspect ratio (default: 8192)")
@@ -97,18 +109,25 @@ def main():
     out_format = "JPEG" if args.format.lower() == "jpg" else args.format.upper()
     ext = f".{args.format.lower()}"
     
+    # Supported input and output extensions
+    supported_exts = {".png", ".jpg", ".jpeg", ".webp"}
+    
     # Resolve target path from positional argument, falling back to --dir or current directory
     input_path = args.path or args.dir or "."
     target_path = Path(input_path).resolve()
     
     if target_path.is_file():
-        if target_path.suffix.lower() != ".png":
-            print(f"Error: Target file '{target_path.name}' is not a PNG image.")
+        if target_path.suffix.lower() not in supported_exts:
+            print(f"Error: Target file '{target_path.name}' is not a supported image format ({', '.join(supported_exts)}).")
             return
-        png_files = [target_path]
+        image_files = [target_path]
         output_dir = target_path.parent / "compressed_for_kanka"
     elif target_path.is_dir():
-        png_files = list(target_path.glob("*.png"))
+        image_files = []
+        for ext_name in supported_exts:
+            image_files.extend(target_path.glob(f"*{ext_name}"))
+            image_files.extend(target_path.glob(f"*{ext_name.upper()}"))
+        image_files = sorted(list(set(image_files)))
         output_dir = target_path / "compressed_for_kanka"
     else:
         print(f"Error: Path '{input_path}' does not exist.")
@@ -117,23 +136,30 @@ def main():
     # Create the output directory
     output_dir.mkdir(exist_ok=True)
     
-    if not png_files:
-        print("No PNG files found in the directory.")
+    # Filter out files that are already inside the output_dir
+    image_files = [f for f in image_files if f.parent != output_dir]
+    
+    if not image_files:
+        print(f"No supported image files ({', '.join(supported_exts)}) found.")
         return
         
-    print(f"Found {len(png_files)} PNG files to process.")
+    print(f"Found {len(image_files)} image files to process.")
     
-    for png_file in png_files:
-        orig_size = os.path.getsize(png_file)
-        print(f"\nProcessing {png_file.name} (Original size: {orig_size / (1024 * 1024):.2f} MB)")
+    for img_file in image_files:
+        orig_size = os.path.getsize(img_file)
+        print(f"\nProcessing {img_file.name} (Original size: {orig_size / (1024 * 1024):.2f} MB)")
         
-        output_path = output_dir / f"{png_file.stem}{ext}"
+        output_path = output_dir / f"{img_file.stem}{ext}"
         
         if output_path.exists() and not args.overwrite:
-            print(f"Skipping {png_file.name}, compressed file already exists. Use --overwrite to replace it.")
+            print(f"Skipping {img_file.name}, compressed file already exists. Use --overwrite to replace it.")
             continue
             
-        compress_image(png_file, output_path, max_file_size, orig_size, out_format, scale=args.scale, max_dim=args.max_dim)
+        if output_path.resolve() == img_file.resolve():
+            print(f"Skipping {img_file.name} to avoid overwriting input file directly.")
+            continue
+            
+        compress_image(img_file, output_path, max_file_size, orig_size, out_format, scale=args.scale, max_dim=args.max_dim)
         
     print("\nAll done! Compressed files are in the 'compressed_for_kanka' folder.")
 
