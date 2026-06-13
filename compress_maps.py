@@ -17,7 +17,34 @@ def parse_size(size_str):
         return float(size_str[:-1])
     return float(size_str)
 
-def compress_image(input_path, output_path, max_file_size, orig_size, out_format="WEBP", scale=1.0, max_dim=8192, forcesquare=None):
+def apply_dirty_pixels(img, out_format):
+    if out_format.upper() in ["JPEG", "JPG"]:
+        return img  # JPEGs do not support transparency/alpha channel
+        
+    if img.mode not in ('RGBA', 'LA'):
+        img = img.convert('RGBA')
+        
+    w, h = img.size
+    pixels = img.load()
+    
+    if img.mode == 'RGBA':
+        # Top-left corner
+        r, g, b, a = pixels[0, 0]
+        pixels[0, 0] = (r, g, b, 1)
+        # Bottom-right corner
+        r, g, b, a = pixels[w - 1, h - 1]
+        pixels[w - 1, h - 1] = (r, g, b, 1)
+    elif img.mode == 'LA':
+        # Top-left corner
+        l, a = pixels[0, 0]
+        pixels[0, 0] = (l, 1)
+        # Bottom-right corner
+        l, a = pixels[w - 1, h - 1]
+        pixels[w - 1, h - 1] = (l, 1)
+        
+    return img
+
+def compress_image(input_path, output_path, max_file_size, orig_size, out_format="WEBP", scale=1.0, max_dim=8192, forcesquare=None, dirty=False):
     # Open the image
     try:
         Image.MAX_IMAGE_PIXELS = None  # Disable decompression bomb protection for huge maps
@@ -40,91 +67,140 @@ def compress_image(input_path, output_path, max_file_size, orig_size, out_format
     # Apply the user-defined scale on top of the fit scale
     base_scale = fit_scale * scale
     
-    # Mathematical estimation to prevent useless compression attempts
-    # Estimate the maximum number of pixels that can realistically fit in max_file_size
-    # at lowest acceptable quality (roughly 0.15 bytes per pixel for lossy, 1.0 for PNG)
-    # Note: we only count actual image pixels here because padding compresses to almost 0 bytes.
-    bytes_per_pixel = 1.0 if out_format.upper() == "PNG" else 0.15
-    max_estimated_pixels = max_file_size / bytes_per_pixel
-    current_pixels = (img.width * base_scale) * (img.height * base_scale)
+    # Check if the image fits at maximum scale (1.0)
+    current_scale = base_scale
+    new_size = (int(img.width * current_scale), int(img.height * current_scale))
+    new_size = (max(1, new_size[0]), max(1, new_size[1]))
     
-    if current_pixels > max_estimated_pixels:
-        estimated_scale_reduction = (max_estimated_pixels / current_pixels) ** 0.5
-        base_scale *= estimated_scale_reduction
-        print(f"Mathematical estimation: Pre-scaling by an additional {estimated_scale_reduction*100:.1f}% to fit target size.")
+    resized_img = img.resize(new_size, Image.Resampling.LANCZOS) if current_scale < 1.0 else img.copy()
     
-    scale_factor = 1.0
-    while scale_factor >= 0.1:
-        current_scale = base_scale * scale_factor
-        new_size = (int(img.width * current_scale), int(img.height * current_scale))
+    if forcesquare is not None:
+        sq_edge = max(resized_img.width, resized_img.height) if forcesquare == -1 else forcesquare
+        if resized_img.width != sq_edge or resized_img.height != sq_edge:
+            if resized_img.mode == 'P':
+                resized_img = resized_img.convert("RGBA")
+            bg_color = (0, 0, 0, 0) if resized_img.mode == 'RGBA' else (0, 0, 0)
+            sq_img = Image.new(resized_img.mode, (sq_edge, sq_edge), bg_color)
+            offset = ((sq_edge - resized_img.width) // 2, (sq_edge - resized_img.height) // 2)
+            sq_img.paste(resized_img, offset)
+            resized_img = sq_img
+            
+    if forcesquare is not None and dirty:
+        resized_img = apply_dirty_pixels(resized_img, out_format)
         
-        # Prevent 0-size dimensions
-        new_size = (max(1, new_size[0]), max(1, new_size[1]))
+    # Save a temporary/test version to see the file size
+    if out_format.upper() == "PNG":
+        resized_img.save(output_path, "PNG")
+    else:
+        resized_img.save(output_path, out_format, quality=85)
         
-        resized_img = img.resize(new_size, Image.Resampling.LANCZOS) if current_scale < 1.0 else img
+    file_size = os.path.getsize(output_path)
+    
+    best_sf = None
+    if file_size <= max_file_size:
+        best_sf = 1.0
+        print(f"Image fits at maximum scale (1.0). Initial size: {file_size / (1024 * 1024):.2f} MB.")
+    else:
+        print(f"Image at maximum scale is too large ({file_size / (1024 * 1024):.2f} MB). Binary searching for optimal scale factor...")
+        low_sf = 0.1
+        high_sf = 1.0
         
-        # Apply forcesquare padding right before checking size/saving
-        if forcesquare is not None:
-            sq_edge = max(resized_img.width, resized_img.height) if forcesquare == -1 else forcesquare
-            if resized_img.width != sq_edge or resized_img.height != sq_edge:
-                if resized_img.mode == 'P':
-                    resized_img = resized_img.convert("RGBA")
-                bg_color = (0, 0, 0, 0) if resized_img.mode == 'RGBA' else (0, 0, 0)
-                sq_img = Image.new(resized_img.mode, (sq_edge, sq_edge), bg_color)
-                offset = ((sq_edge - resized_img.width) // 2, (sq_edge - resized_img.height) // 2)
-                sq_img.paste(resized_img, offset)
-                resized_img = sq_img
+        # 5 iterations of binary search for scale factor
+        for i in range(5):
+            sf = (low_sf + high_sf) / 2
+            current_scale = base_scale * sf
+            new_size = (int(img.width * current_scale), int(img.height * current_scale))
+            new_size = (max(1, new_size[0]), max(1, new_size[1]))
+            
+            resized_img = img.resize(new_size, Image.Resampling.LANCZOS) if current_scale < 1.0 else img.copy()
+            
+            if forcesquare is not None:
+                sq_edge = max(resized_img.width, resized_img.height) if forcesquare == -1 else forcesquare
+                if resized_img.width != sq_edge or resized_img.height != sq_edge:
+                    if resized_img.mode == 'P':
+                        resized_img = resized_img.convert("RGBA")
+                    bg_color = (0, 0, 0, 0) if resized_img.mode == 'RGBA' else (0, 0, 0)
+                    sq_img = Image.new(resized_img.mode, (sq_edge, sq_edge), bg_color)
+                    offset = ((sq_edge - resized_img.width) // 2, (sq_edge - resized_img.height) // 2)
+                    sq_img.paste(resized_img, offset)
+                    resized_img = sq_img
+                    
+            if forcesquare is not None and dirty:
+                resized_img = apply_dirty_pixels(resized_img, out_format)
+                
+            if out_format.upper() == "PNG":
+                resized_img.save(output_path, "PNG")
+            else:
+                resized_img.save(output_path, out_format, quality=85)
+                
+            file_size = os.path.getsize(output_path)
+            print(f"  Scale factor test {i+1}: sf={sf:.3f} ({resized_img.width}x{resized_img.height}) -> {file_size / (1024 * 1024):.2f} MB")
+            
+            if file_size <= max_file_size:
+                best_sf = sf
+                low_sf = sf
+            else:
+                high_sf = sf
+                
+        if best_sf is None:
+            best_sf = 0.1
+            print(f"Warning: Image is still too large at minimum scale (0.1). Using scale 0.1.")
+
+    # Re-save/fine-tune quality at the best scale factor
+    current_scale = base_scale * best_sf
+    new_size = (int(img.width * current_scale), int(img.height * current_scale))
+    new_size = (max(1, new_size[0]), max(1, new_size[1]))
+    resized_img = img.resize(new_size, Image.Resampling.LANCZOS) if current_scale < 1.0 else img.copy()
+    
+    if forcesquare is not None:
+        sq_edge = max(resized_img.width, resized_img.height) if forcesquare == -1 else forcesquare
+        if resized_img.width != sq_edge or resized_img.height != sq_edge:
+            if resized_img.mode == 'P':
+                resized_img = resized_img.convert("RGBA")
+            bg_color = (0, 0, 0, 0) if resized_img.mode == 'RGBA' else (0, 0, 0)
+            sq_img = Image.new(resized_img.mode, (sq_edge, sq_edge), bg_color)
+            offset = ((sq_edge - resized_img.width) // 2, (sq_edge - resized_img.height) // 2)
+            sq_img.paste(resized_img, offset)
+            resized_img = sq_img
+            
+    if forcesquare is not None and dirty:
+        resized_img = apply_dirty_pixels(resized_img, out_format)
+
+    if out_format.upper() == "PNG":
+        resized_img.save(output_path, "PNG", optimize=True)
+        file_size = os.path.getsize(output_path)
+        print(f"Success! {output_path.name} is now {file_size / (1024 * 1024):.2f} MB (scale factor {best_sf:.3f}).")
+    else:
+        low_q = 1
+        high_q = 100
+        best_q = None
         
-        print(f"Trying to compress {input_path.name} at {resized_img.width}x{resized_img.height} (image content: {new_size[0]}x{new_size[1]})...")
-        
-        if out_format.upper() == "PNG":
-            # Save lossless PNG with optimization
-            resized_img.save(output_path, "PNG", optimize=True)
+        while low_q <= high_q:
+            quality = (low_q + high_q) // 2
+            resized_img.save(output_path, out_format, quality=quality)
             file_size = os.path.getsize(output_path)
             
             if file_size <= max_file_size:
+                best_q = quality
+                # If we are within 10% of the target size, we are good!
+                if file_size >= max_file_size * 0.9:
+                    break
+                low_q = quality + 1
+            else:
+                high_q = quality - 1
+                
+        if best_q is not None:
+            resized_img.save(output_path, out_format, quality=best_q)
+            file_size = os.path.getsize(output_path)
+            print(f"Optimal compression found: quality {best_q} at scale factor {best_sf:.3f}.")
+            if file_size >= orig_size:
+                print(f"Notice: The compressed {out_format} is actually larger than or equal to the original ({file_size / (1024 * 1024):.2f} MB vs {orig_size / (1024 * 1024):.2f} MB).")
+            else:
                 print(f"Success! {output_path.name} is now {file_size / (1024 * 1024):.2f} MB.")
-                return
         else:
-            low = 1
-            high = 100
-            best_q_for_scale = None
-            
-            # Binary search for the optimal quality between 1 and 100
-            while low <= high:
-                quality = (low + high) // 2
-                resized_img.save(output_path, out_format, quality=quality)
-                file_size = os.path.getsize(output_path)
-                
-                if file_size <= max_file_size:
-                    best_q_for_scale = quality
-                    
-                    # If we are within 10% of the target size, it's perfect!
-                    if file_size >= max_file_size * 0.9:
-                        break
-                    
-                    # Too small, try higher quality
-                    low = quality + 1
-                else:
-                    # Too big, try lower quality
-                    high = quality - 1
-                    
-            if best_q_for_scale is not None:
-                # Re-save with best quality to ensure output_path has the right file
-                resized_img.save(output_path, out_format, quality=best_q_for_scale)
-                file_size = os.path.getsize(output_path)
-                
-                print(f"Optimal compression found: quality {best_q_for_scale}.")
-                if file_size >= orig_size:
-                    print(f"Notice: The compressed {out_format} is actually larger than or equal to the original ({file_size / (1024 * 1024):.2f} MB vs {orig_size / (1024 * 1024):.2f} MB). You might just want to use the original!")
-                else:
-                    print(f"Success! {output_path.name} is now {file_size / (1024 * 1024):.2f} MB.")
-                return
-            
-        print(f"Even at minimum quality/size, image is too large. Scaling dimensions down by 20%...")
-        scale_factor *= 0.8
-        
-    print(f"Warning: {input_path.name} could not be compressed under {max_file_size / (1024 * 1024):.1f}MB without severe degradation.")
+            resized_img.save(output_path, out_format, quality=1)
+            file_size = os.path.getsize(output_path)
+            print(f"Saved at minimum quality 1. Final size: {file_size / (1024 * 1024):.2f} MB.")
 
 def main():
     parser = argparse.ArgumentParser(description="Compress PNG maps to WebP/JPEG format.")
@@ -136,6 +212,7 @@ def main():
     parser.add_argument("--scale", type=float, default=1.0, help="Initial scale factor to resize image, preserving aspect ratio (default: 1.0)")
     parser.add_argument("--max-dim", type=int, default=8192, help="Maximum dimension (width or height) in pixels, preserving aspect ratio (default: 8192)")
     parser.add_argument("--forcesquare", nargs='?', const=-1, default=None, type=int, help="Expand canvas size to a square. Provide an optional dimension (e.g. --forcesquare 4096), otherwise defaults to the longer edge.")
+    parser.add_argument("--dirty", action="store_true", help="Add a nearly transparent pixel (opacity 1/255) to the top-left and bottom-right corners of the padded canvas to prevent auto-trimming.")
     args = parser.parse_args()
     
     max_file_size = parse_size(args.size) * 1024 * 1024
@@ -192,7 +269,7 @@ def main():
             print(f"Skipping {img_file.name} to avoid overwriting input file directly.")
             continue
             
-        compress_image(img_file, output_path, max_file_size, orig_size, out_format, scale=args.scale, max_dim=args.max_dim, forcesquare=args.forcesquare)
+        compress_image(img_file, output_path, max_file_size, orig_size, out_format, scale=args.scale, max_dim=args.max_dim, forcesquare=args.forcesquare, dirty=args.dirty)
         
     print("\nAll done! Compressed files are in the 'compressed_for_kanka' folder.")
 
