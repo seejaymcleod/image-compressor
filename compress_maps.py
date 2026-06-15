@@ -28,50 +28,124 @@ def apply_dirty_pixels(img, out_format):
     pixels = img.load()
     
     if img.mode == 'RGBA':
-        # Top-left corner
         r, g, b, a = pixels[0, 0]
         pixels[0, 0] = (r, g, b, 1)
-        # Bottom-right corner
         r, g, b, a = pixels[w - 1, h - 1]
         pixels[w - 1, h - 1] = (r, g, b, 1)
     elif img.mode == 'LA':
-        # Top-left corner
         l, a = pixels[0, 0]
         pixels[0, 0] = (l, 1)
-        # Bottom-right corner
         l, a = pixels[w - 1, h - 1]
         pixels[w - 1, h - 1] = (l, 1)
         
     return img
 
-def compress_image(input_path, output_path, max_file_size, orig_size, out_format="WEBP", scale=1.0, max_dim=8192, forcesquare=None, dirty=False):
-    # Open the image
-    try:
-        Image.MAX_IMAGE_PIXELS = None  # Disable decompression bomb protection for huge maps
-        img = Image.open(input_path)
-        img = ImageOps.exif_transpose(img) # Fixes EXIF orientation by permanently rotating the pixels
+class ProgressConsole:
+    def __init__(self, total_files):
+        self.total_files = total_files
+        self.current_file_idx = 0
+        self.file_name = ""
+        self.out_format = ""
+        self.orig_size_mb = 0
         
-        # Ensure we are in RGB mode if saving to JPEG
+        self.file_progress_total = 1
+        self.file_progress_current = 0
+        self.file_status = ""
+        self.lines_printed = 0
+        
+    def start_file(self, file_name, out_format, orig_size_mb):
+        self.current_file_idx += 1
+        self.file_name = file_name
+        self.out_format = out_format
+        self.orig_size_mb = orig_size_mb
+        self.file_progress_total = 100
+        self.file_progress_current = 0
+        self.file_status = f"Making file with format {out_format.upper()}..."
+        self.update()
+        
+    def update_file(self, current, total, status):
+        self.file_progress_current = current
+        self.file_progress_total = total
+        self.file_status = status
+        self.update()
+
+    def print_warning(self, msg):
+        self.clear()
+        print(f"  [!] {msg}")
+        self.update()
+        
+    def skip_file(self, file_name, message):
+        self.clear()
+        print(f"[-] Skipped {file_name}: {message}")
+        self.lines_printed = 0
+        
+    def finish_file(self, message):
+        self.file_progress_current = self.file_progress_total
+        self.file_status = "Done!"
+        self.update()
+        
+        self.clear()
+        dir_pct = int((self.current_file_idx / self.total_files) * 100)
+        print(f"[{dir_pct:3}%] {self.file_name} -> {self.out_format.upper()} | Confirmed: {message}")
+        self.lines_printed = 0
+
+    def clear(self):
+        if self.lines_printed > 0:
+            sys.stdout.write(f"\033[{self.lines_printed}A")
+            for _ in range(self.lines_printed):
+                sys.stdout.write("\033[K\n")
+            sys.stdout.write(f"\033[{self.lines_printed}A")
+            self.lines_printed = 0
+
+    def get_bar(self, current, total, width=30):
+        if total <= 0:
+            return "[" + " " * width + "]   0%"
+        pct = min(1.0, current / total)
+        filled = int(width * pct)
+        bar = "█" * filled + "-" * (width - filled)
+        return f"[{bar}] {int(pct * 100):3}%"
+
+    def update(self):
+        self.clear()
+        
+        dir_bar = self.get_bar(self.current_file_idx - 1, self.total_files) 
+        print(f"Directory: {dir_bar} ({self.current_file_idx}/{self.total_files})")
+        
+        print(f"File:      {self.file_name} ({self.orig_size_mb:.2f} MB)")
+        
+        file_bar = self.get_bar(self.file_progress_current, self.file_progress_total)
+        print(f"Progress:  {file_bar} | {self.file_status}")
+        
+        self.lines_printed = 3
+        sys.stdout.flush()
+
+def compress_image(input_path, output_path, max_file_size, orig_size, out_format="WEBP", scale=1.0, max_dim=8192, forcesquare=None, dirty=False, console=None):
+    if console is None:
+        console = type("DummyConsole", (), {"update_file": lambda *a: None, "finish_file": print, "print_warning": print})()
+
+    try:
+        Image.MAX_IMAGE_PIXELS = None
+        img = Image.open(input_path)
+        img = ImageOps.exif_transpose(img)
+        
         if out_format.upper() in ["JPEG", "JPG"] and img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
     except Exception as e:
-        print(f"Failed to open {input_path.name}: {e}")
+        console.print_warning(f"Failed to open {input_path.name}: {e}")
         return
 
-    # First, calculate scale needed to fit within max_dim
+    console.update_file(5, 100, "Calculating dimensions...")
     fit_scale = 1.0
     img_max_edge = max(img.width, img.height)
     if img_max_edge > max_dim:
         fit_scale = max_dim / img_max_edge
         
-    # Apply the user-defined scale on top of the fit scale
     base_scale = fit_scale * scale
-    
-    # Check if the image fits at maximum scale (1.0)
     current_scale = base_scale
-    new_size = (int(img.width * current_scale), int(img.height * current_scale))
+    new_size = (round(img.width * current_scale), round(img.height * current_scale))
     new_size = (max(1, new_size[0]), max(1, new_size[1]))
     
+    console.update_file(10, 100, "Initial resizing...")
     resized_img = img.resize(new_size, Image.Resampling.LANCZOS) if current_scale < 1.0 else img.copy()
     
     if forcesquare is not None:
@@ -88,7 +162,7 @@ def compress_image(input_path, output_path, max_file_size, orig_size, out_format
     if forcesquare is not None and dirty:
         resized_img = apply_dirty_pixels(resized_img, out_format)
         
-    # Save a temporary/test version to see the file size
+    console.update_file(20, 100, "Saving test image...")
     if out_format.upper() == "PNG":
         resized_img.save(output_path, "PNG")
     else:
@@ -99,17 +173,16 @@ def compress_image(input_path, output_path, max_file_size, orig_size, out_format
     best_sf = None
     if file_size <= max_file_size:
         best_sf = 1.0
-        print(f"Image fits at maximum scale (1.0). Initial size: {file_size / (1024 * 1024):.2f} MB.")
+        console.update_file(50, 100, "Fits at max scale!")
     else:
-        print(f"Image at maximum scale is too large ({file_size / (1024 * 1024):.2f} MB). Binary searching for optimal scale factor...")
         low_sf = 0.1
         high_sf = 1.0
         
-        # 5 iterations of binary search for scale factor
         for i in range(5):
             sf = (low_sf + high_sf) / 2
+            console.update_file(20 + i * 6, 100, f"Binary search scale {i+1}/5...")
             current_scale = base_scale * sf
-            new_size = (int(img.width * current_scale), int(img.height * current_scale))
+            new_size = (round(img.width * current_scale), round(img.height * current_scale))
             new_size = (max(1, new_size[0]), max(1, new_size[1]))
             
             resized_img = img.resize(new_size, Image.Resampling.LANCZOS) if current_scale < 1.0 else img.copy()
@@ -134,7 +207,6 @@ def compress_image(input_path, output_path, max_file_size, orig_size, out_format
                 resized_img.save(output_path, out_format, quality=85)
                 
             file_size = os.path.getsize(output_path)
-            print(f"  Scale factor test {i+1}: sf={sf:.3f} ({resized_img.width}x{resized_img.height}) -> {file_size / (1024 * 1024):.2f} MB")
             
             if file_size <= max_file_size:
                 best_sf = sf
@@ -144,11 +216,11 @@ def compress_image(input_path, output_path, max_file_size, orig_size, out_format
                 
         if best_sf is None:
             best_sf = 0.1
-            print(f"Warning: Image is still too large at minimum scale (0.1). Using scale 0.1.")
+            console.print_warning("Image is still too large at minimum scale (0.1).")
 
-    # Re-save/fine-tune quality at the best scale factor
+    console.update_file(60, 100, "Applying optimal scale...")
     current_scale = base_scale * best_sf
-    new_size = (int(img.width * current_scale), int(img.height * current_scale))
+    new_size = (round(img.width * current_scale), round(img.height * current_scale))
     new_size = (max(1, new_size[0]), max(1, new_size[1]))
     resized_img = img.resize(new_size, Image.Resampling.LANCZOS) if current_scale < 1.0 else img.copy()
     
@@ -167,22 +239,25 @@ def compress_image(input_path, output_path, max_file_size, orig_size, out_format
         resized_img = apply_dirty_pixels(resized_img, out_format)
 
     if out_format.upper() == "PNG":
+        console.update_file(80, 100, "Optimizing PNG output...")
         resized_img.save(output_path, "PNG", optimize=True)
         file_size = os.path.getsize(output_path)
-        print(f"Success! {output_path.name} is now {file_size / (1024 * 1024):.2f} MB (scale factor {best_sf:.3f}).")
+        console.finish_file(f"Size: {file_size / (1024 * 1024):.2f} MB")
     else:
         low_q = 1
         high_q = 100
         best_q = None
         
+        q_iters = 0
         while low_q <= high_q:
+            q_iters += 1
             quality = (low_q + high_q) // 2
+            console.update_file(60 + q_iters * 4, 100, f"Quality search (q={quality})...")
             resized_img.save(output_path, out_format, quality=quality)
             file_size = os.path.getsize(output_path)
             
             if file_size <= max_file_size:
                 best_q = quality
-                # If we are within 10% of the target size, we are good!
                 if file_size >= max_file_size * 0.9:
                     break
                 low_q = quality + 1
@@ -190,17 +265,17 @@ def compress_image(input_path, output_path, max_file_size, orig_size, out_format
                 high_q = quality - 1
                 
         if best_q is not None:
+            console.update_file(95, 100, "Saving optimal quality...")
             resized_img.save(output_path, out_format, quality=best_q)
             file_size = os.path.getsize(output_path)
-            print(f"Optimal compression found: quality {best_q} at scale factor {best_sf:.3f}.")
             if file_size >= orig_size:
-                print(f"Notice: The compressed {out_format} is actually larger than or equal to the original ({file_size / (1024 * 1024):.2f} MB vs {orig_size / (1024 * 1024):.2f} MB).")
-            else:
-                print(f"Success! {output_path.name} is now {file_size / (1024 * 1024):.2f} MB.")
+                console.print_warning(f"Notice: Compressed format is actually larger ({file_size / (1024 * 1024):.2f} MB).")
+            console.finish_file(f"Size: {file_size / (1024 * 1024):.2f} MB")
         else:
+            console.update_file(95, 100, "Saving minimum quality...")
             resized_img.save(output_path, out_format, quality=1)
             file_size = os.path.getsize(output_path)
-            print(f"Saved at minimum quality 1. Final size: {file_size / (1024 * 1024):.2f} MB.")
+            console.finish_file(f"Saved at min quality 1. Size: {file_size / (1024 * 1024):.2f} MB")
 
 def main():
     parser = argparse.ArgumentParser(description="Compress PNG maps to WebP/JPEG format.")
@@ -240,10 +315,8 @@ def main():
     out_format = "JPEG" if args.format.lower() == "jpg" else args.format.upper()
     ext = f".{args.format.lower()}"
     
-    # Supported input and output extensions
     supported_exts = {".png", ".jpg", ".jpeg", ".webp"}
     
-    # Resolve target path from positional argument, falling back to --dir or current directory
     input_path = args.path or args.dir or "."
     target_path = Path(input_path).resolve()
     
@@ -264,33 +337,33 @@ def main():
         print(f"Error: Path '{input_path}' does not exist.")
         return
         
-    # Create the output directory
     output_dir.mkdir(exist_ok=True)
-    
-    # Filter out files that are already inside the output_dir
     image_files = [f for f in image_files if f.parent != output_dir]
     
     if not image_files:
         print(f"No supported image files ({', '.join(supported_exts)}) found.")
         return
         
-    print(f"Found {len(image_files)} image files to process.")
+    print(f"Found {len(image_files)} image files to process.\n")
+    console = ProgressConsole(len(image_files))
     
     for img_file in image_files:
-        orig_size = os.path.getsize(img_file)
-        print(f"\nProcessing {img_file.name} (Original size: {orig_size / (1024 * 1024):.2f} MB)")
+        orig_size_mb = os.path.getsize(img_file) / (1024 * 1024)
         
         output_path = output_dir / f"{img_file.stem}{ext}"
         
         if output_path.exists() and not args.overwrite:
-            print(f"Skipping {img_file.name}, compressed file already exists. Use --overwrite to replace it.")
+            console.current_file_idx += 1
+            console.skip_file(img_file.name, "already exists (use --overwrite to replace)")
             continue
             
         if output_path.resolve() == img_file.resolve():
-            print(f"Skipping {img_file.name} to avoid overwriting input file directly.")
+            console.current_file_idx += 1
+            console.skip_file(img_file.name, "would overwrite input file directly")
             continue
             
-        compress_image(img_file, output_path, max_file_size, orig_size, out_format, scale=args.scale, max_dim=args.max_dim, forcesquare=args.forcesquare, dirty=args.dirty)
+        console.start_file(img_file.name, out_format, orig_size_mb)
+        compress_image(img_file, output_path, max_file_size, orig_size_mb * 1024 * 1024, out_format, scale=args.scale, max_dim=args.max_dim, forcesquare=args.forcesquare, dirty=args.dirty, console=console)
         
     print("\nAll done! Compressed files are in the 'compressed_for_kanka' folder.")
 
