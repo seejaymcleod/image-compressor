@@ -213,7 +213,7 @@ def main():
     parser.add_argument("--max-dim", type=int, default=8192, help="Maximum dimension (width or height) in pixels, preserving aspect ratio (default: 8192)")
     parser.add_argument("--forcesquare", nargs='?', const=-1, default=None, type=int, help="Expand canvas size to a square. Provide an optional dimension (e.g. --forcesquare 4096), otherwise defaults to the longer edge.")
     parser.add_argument("--dirty", action="store_true", help="Add a nearly transparent pixel (opacity 1/255) to the top-left and bottom-right corners of the padded canvas to prevent auto-trimming.")
-    parser.add_argument("--preset", type=str, choices=["kanka"], help="Apply preset configuration ('kanka' sets path to '../', size to 9.5, format to webp, max-dim to 8192)")
+    parser.add_argument("--preset", type=str, choices=["kanka", "viewer"], help="Apply preset configuration")
     args = parser.parse_args()
     
     if args.preset == "kanka":
@@ -223,6 +223,16 @@ def main():
             args.format = "webp"
         if "--max-dim" not in sys.argv:
             args.max_dim = 8192
+        if args.path is None and args.dir is None:
+            args.path = "../"
+            
+    if args.preset == "viewer":
+        if "--size" not in sys.argv:
+            args.size = "50"
+        if "--format" not in sys.argv:
+            args.format = "webp"
+        if "--max-dim" not in sys.argv:
+            args.max_dim = 16000
         if args.path is None and args.dir is None:
             args.path = "../"
             
